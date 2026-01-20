@@ -38,12 +38,6 @@ class VirtualAddressSpaceBase
 };
 
 /*
- * Helper routine to determine whether one set of page permissions (the lhs) is
- * a subset of another one (the rhs).
- */
-V8_BASE_EXPORT bool IsSubset(PagePermissions lhs, PagePermissions rhs);
-
-/*
  * The virtual address space of the current process. Conceptionally, there
  * should only be one such "root" instance. However, in practice there is no
  * issue with having multiple instances as the actual resources are managed by
@@ -72,7 +66,7 @@ class V8_BASE_EXPORT VirtualAddressSpace : public VirtualAddressSpaceBase {
 
   Address AllocateSharedPages(Address hint, size_t size,
                               PagePermissions permissions,
-                              PlatformSharedMemoryHandle handle,
+                              SharedMemoryHandle handle,
                               uint64_t offset) override;
 
   void FreeSharedPages(Address address, size_t size) override;
@@ -84,8 +78,8 @@ class V8_BASE_EXPORT VirtualAddressSpace : public VirtualAddressSpaceBase {
   std::unique_ptr<v8::VirtualAddressSpace> AllocateSubspace(
       Address hint, size_t size, size_t alignment,
       PagePermissions max_page_permissions,
-      std::optional<MemoryProtectionKeyId> key = std::nullopt,
-      PlatformSharedMemoryHandle handle = kInvalidSharedMemoryHandle) override;
+      std::optional<MemoryProtectionKeyId> key,
+      std::optional<SharedMemoryHandle> handle) override;
 
   bool RecommitPages(Address address, size_t size,
                      PagePermissions access) override;
@@ -124,7 +118,7 @@ class V8_BASE_EXPORT VirtualAddressSubspace : public VirtualAddressSpaceBase {
 
   Address AllocateSharedPages(Address hint, size_t size,
                               PagePermissions permissions,
-                              PlatformSharedMemoryHandle handle,
+                              SharedMemoryHandle handle,
                               uint64_t offset) override;
 
   void FreeSharedPages(Address address, size_t size) override;
@@ -136,8 +130,8 @@ class V8_BASE_EXPORT VirtualAddressSubspace : public VirtualAddressSpaceBase {
   std::unique_ptr<v8::VirtualAddressSpace> AllocateSubspace(
       Address hint, size_t size, size_t alignment,
       PagePermissions max_page_permissions,
-      std::optional<MemoryProtectionKeyId> key = std::nullopt,
-      PlatformSharedMemoryHandle handle = kInvalidSharedMemoryHandle) override;
+      std::optional<MemoryProtectionKeyId> key,
+      std::optional<SharedMemoryHandle> handle) override;
 
   bool RecommitPages(Address address, size_t size,
                      PagePermissions permissions) override;

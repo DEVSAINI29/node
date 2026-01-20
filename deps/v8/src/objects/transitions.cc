@@ -31,6 +31,7 @@ bool TransitionsAccessor::HasSimpleTransitionTo(Tagged<Map> map) {
     case kWeakRef:
       return raw_transitions_.GetHeapObjectAssumeWeak() == map;
     case kPrototypeInfo:
+    case kPrototypeSharedClosureInfo:
     case kUninitialized:
     case kMigrationTarget:
     case kFullTransitionArray:
@@ -173,6 +174,11 @@ void TransitionsAccessor::InsertHelper(Isolate* isolate, DirectHandle<Map> map,
       }
       array->SetKey(insertion_index, *name);
       array->SetRawTarget(insertion_index, MakeWeak(*target));
+      // The new size exceeds the threshold for linear search, sort the array
+      // for binary search later.
+      if (new_nof == TransitionArray::kMaxElementsForLinearSearch + 1) {
+        array->Sort();
+      }
       SLOW_DCHECK(array->IsSortedNoDuplicates());
       return;
     }
@@ -222,6 +228,11 @@ void TransitionsAccessor::InsertHelper(Isolate* isolate, DirectHandle<Map> map,
     result->Set(i + 1, array->GetKey(i), array->GetRawTarget(i));
   }
 
+  // The new size exceeds the threshold for linear search, sort the array
+  // for binary search later.
+  if (new_nof == TransitionArray::kMaxElementsForLinearSearch + 1) {
+    result->Sort();
+  }
   SLOW_DCHECK(result->IsSortedNoDuplicates());
   ReplaceTransitions(isolate, map, result);
 }
@@ -231,6 +242,7 @@ Tagged<Map> TransitionsAccessor::SearchTransition(
   DCHECK(IsUniqueName(name));
   switch (encoding()) {
     case kPrototypeInfo:
+    case kPrototypeSharedClosureInfo:
     case kUninitialized:
     case kMigrationTarget:
       return Tagged<Map>();
@@ -264,7 +276,8 @@ bool TransitionsAccessor::IsSpecialTransition(ReadOnlyRoots roots,
   return name == roots.nonextensible_symbol() ||
          name == roots.sealed_symbol() || name == roots.frozen_symbol() ||
          name == roots.elements_transition_symbol() ||
-         name == roots.strict_function_transition_symbol();
+         name == roots.strict_function_transition_symbol() ||
+         name == roots.detached_symbol();
 }
 
 MaybeHandle<Map> TransitionsAccessor::FindTransitionToField(
@@ -288,6 +301,7 @@ void TransitionsAccessor::ForEachTransitionTo(
   DCHECK(IsUniqueName(name));
   switch (encoding()) {
     case kPrototypeInfo:
+    case kPrototypeSharedClosureInfo:
     case kUninitialized:
     case kMigrationTarget:
       return;
@@ -503,6 +517,7 @@ void TransitionArray::SetNumberOfPrototypeTransitions(
 int TransitionsAccessor::NumberOfTransitions() {
   switch (encoding()) {
     case kPrototypeInfo:
+    case kPrototypeSharedClosureInfo:
     case kUninitialized:
     case kMigrationTarget:
       return 0;
@@ -517,6 +532,7 @@ int TransitionsAccessor::NumberOfTransitions() {
 bool TransitionsAccessor::HasPrototypeTransitions() {
   switch (encoding()) {
     case kPrototypeInfo:
+    case kPrototypeSharedClosureInfo:
     case kUninitialized:
     case kMigrationTarget:
     case kWeakRef:
@@ -624,6 +640,7 @@ void TransitionsAccessor::TraverseTransitionTreeInternal(
 
     switch (encoding) {
       case kPrototypeInfo:
+      case kPrototypeSharedClosureInfo:
       case kUninitialized:
       case kMigrationTarget:
         break;
@@ -779,6 +796,9 @@ void TransitionArray::Sort() {
   DisallowGarbageCollection no_gc;
   // In-place insertion sort.
   int length = number_of_transitions();
+  // Sorting matters only for binary search.
+  if (length <= kMaxElementsForLinearSearch) return;
+
   ReadOnlyRoots roots = GetReadOnlyRoots();
   for (int i = 1; i < length; i++) {
     Tagged<Name> key = GetKey(i);

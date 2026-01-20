@@ -1735,8 +1735,8 @@ class DiscardBaselineCodeVisitor : public ThreadVisitor {
           frame->LookupCode()->SetMarkedForDeoptimization(
               isolate, LazyDeoptimizeReason::kDebugger);
         } else {
-          PointerAuthentication::ReplacePC(pc_addr, advance,
-                                           kSystemPointerSize);
+          PointerAuthentication::ReplacePC(pc_addr, advance, kSystemPointerSize,
+                                           it.frame()->iteration_depth());
         }
         InterpretedFrame::cast(it.Reframe())
             ->PatchBytecodeOffset(bytecode_offset);
@@ -2870,8 +2870,10 @@ void Debug::HandleDebugBreak(IgnoreBreakMode ignore_break_mode,
   MaybeHandle<FixedArray> break_points;
   {
     DebuggableStackFrameIterator it(isolate_);
-    DCHECK(!it.done());
-    JavaScriptFrame* frame = it.frame()->is_javascript()
+    // We can get here when the early steps of processing microtasks find
+    // a pending interrupt request for an OOM callback; in that case there
+    // is no debuggable frame on the stack.
+    JavaScriptFrame* frame = !it.done() && it.frame()->is_javascript()
                                  ? JavaScriptFrame::cast(it.frame())
                                  : nullptr;
     if (frame && IsJSFunction(frame->function())) {

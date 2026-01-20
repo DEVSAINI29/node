@@ -14,7 +14,7 @@ namespace internal {
 
 class AlternativeGenerationList;
 class BoyerMooreLookahead;
-class FixedLengthLoopState;
+class SpecialLoopState;
 class NodeVisitor;
 class QuickCheckDetails;
 class RegExpCompiler;
@@ -100,34 +100,32 @@ struct NodeInfo final {
 struct EatsAtLeastInfo final {
   EatsAtLeastInfo() : EatsAtLeastInfo(0) {}
   explicit EatsAtLeastInfo(uint8_t eats)
-      : eats_at_least_from_possibly_start(eats),
-        eats_at_least_from_not_start(eats) {}
+      : from_possibly_start(eats), from_not_start(eats) {}
   void SetMin(const EatsAtLeastInfo& other) {
-    if (other.eats_at_least_from_possibly_start <
-        eats_at_least_from_possibly_start) {
-      eats_at_least_from_possibly_start =
-          other.eats_at_least_from_possibly_start;
-    }
-    if (other.eats_at_least_from_not_start < eats_at_least_from_not_start) {
-      eats_at_least_from_not_start = other.eats_at_least_from_not_start;
-    }
+    from_possibly_start =
+        std::min(from_possibly_start, other.from_possibly_start);
+    from_not_start = std::min(from_not_start, other.from_not_start);
+  }
+  void SetMax(int other) {
+    uint8_t max = base::saturated_cast<uint8_t>(other);
+    from_possibly_start = std::max(from_possibly_start, max);
+    from_not_start = std::max(from_not_start, max);
   }
 
   bool IsZero() const {
-    return eats_at_least_from_possibly_start == 0 &&
-           eats_at_least_from_not_start == 0;
+    return from_possibly_start == 0 && from_not_start == 0;
   }
 
   // Any successful match starting from the current node will consume at least
   // this many characters. This does not necessarily mean that there is a
   // possible match with exactly this many characters, but we generally try to
   // get this number as high as possible to allow for early exit on failure.
-  uint8_t eats_at_least_from_possibly_start;
+  uint8_t from_possibly_start;
 
-  // Like eats_at_least_from_possibly_start, but with the additional assumption
+  // Like from_possibly_start, but with the additional assumption
   // that start-of-string assertions (^) can't match. This value is greater than
-  // or equal to eats_at_least_from_possibly_start.
-  uint8_t eats_at_least_from_not_start;
+  // or equal to from_possibly_start.
+  uint8_t from_not_start;
 };
 
 class EmitResult final {
@@ -167,15 +165,7 @@ class RegExpNode : public ZoneObject {
   // fail and can be ignored when determining how many characters are consumed
   // on success.  If this node has not been analyzed yet, EatsAtLeast returns 0.
   uint32_t EatsAtLeast(bool not_at_start);
-  // Returns how many characters this node must consume in order to succeed,
-  // given that this is a LoopChoiceNode whose counter register is in a
-  // newly-initialized state at the current position in the generated code. For
-  // example, consider /a{6,8}/. Absent any extra information, the
-  // LoopChoiceNode for the repetition must report that it consumes at least
-  // zero characters, because it may have already looped several times. However,
-  // with a newly-initialized counter, it can report that it consumes at least
-  // six characters.
-  virtual EatsAtLeastInfo EatsAtLeastFromLoopEntry();
+  static constexpr uint32_t kLargeEatsAtLeastValue = 255;
   // Emits some quick code that checks whether the preloaded characters match.
   // Falls through on certain failure, jumps to the label on possible success.
   // If the node cannot make a quick check it does nothing and returns false.
@@ -190,19 +180,8 @@ class RegExpNode : public ZoneObject {
   // A comparison success indicates the node may match.
   virtual void GetQuickCheckDetails(QuickCheckDetails* details,
                                     RegExpCompiler* compiler,
-                                    int characters_filled_in,
-                                    bool not_at_start) = 0;
-  // Fills in quick check details for this node, given that this is a
-  // LoopChoiceNode whose counter register is in a newly-initialized state at
-  // the current position in the generated code. For example, consider /a{6,8}/.
-  // Absent any extra information, the LoopChoiceNode for the repetition cannot
-  // generate any useful quick check because a match might be the (empty)
-  // continuation node. However, with a newly-initialized counter, it can
-  // generate a quick check for several 'a' characters at once.
-  virtual void GetQuickCheckDetailsFromLoopEntry(QuickCheckDetails* details,
-                                                 RegExpCompiler* compiler,
-                                                 int characters_filled_in,
-                                                 bool not_at_start);
+                                    int characters_filled_in, bool not_at_start,
+                                    int budget) = 0;
   static const int kNodeIsTooComplexForFixedLengthLoops = kMinInt;
   virtual int FixedLengthLoopLength() {
     return kNodeIsTooComplexForFixedLengthLoops;
@@ -223,24 +202,7 @@ class RegExpNode : public ZoneObject {
   bool KeepRecursing(RegExpCompiler* compiler);
   virtual void FillInBMInfo(Isolate* isolate, int offset, int budget,
                             BoyerMooreLookahead* bm, bool not_at_start) {
-    UNREACHABLE();
-  }
-
-  // If we know that the input is one-byte then there are some nodes that can
-  // never match.  This method returns a node that can be substituted for
-  // itself, or nullptr if the node can never match.
-  virtual RegExpNode* FilterOneByte(int depth, RegExpCompiler* compiler) {
-    return this;
-  }
-  // Helper for FilterOneByte.
-  RegExpNode* replacement() {
-    DCHECK(info()->replacement_calculated);
-    return replacement_;
-  }
-  RegExpNode* set_replacement(RegExpNode* replacement) {
-    info()->replacement_calculated = true;
-    replacement_ = replacement;
-    return replacement;  // For convenience.
+    return;
   }
 
   // We want to avoid recalculating the lookahead info, so we store it on the
@@ -290,6 +252,8 @@ class RegExpNode : public ZoneObject {
 
   Zone* zone() const { return zone_; }
 
+  virtual bool IsBacktrack() const { return false; }
+
  protected:
   enum LimitResult { DONE, CONTINUE };
   RegExpNode* replacement_;
@@ -327,16 +291,12 @@ class SeqRegExpNode : public RegExpNode {
       : RegExpNode(on_success->zone()), on_success_(on_success) {}
   RegExpNode* on_success() { return on_success_; }
   void set_on_success(RegExpNode* node) { on_success_ = node; }
-  RegExpNode* FilterOneByte(int depth, RegExpCompiler* compiler) override;
   void FillInBMInfo(Isolate* isolate, int offset, int budget,
                     BoyerMooreLookahead* bm, bool not_at_start) override {
     on_success_->FillInBMInfo(isolate, offset, budget - 1, bm, not_at_start);
     if (offset == 0) set_bm_info(not_at_start, bm);
   }
   SeqRegExpNode* AsSeqRegExpNode() override { return this; }
-
- protected:
-  RegExpNode* FilterSuccessor(int depth, RegExpCompiler* compiler);
 
  private:
   RegExpNode* on_success_;
@@ -347,19 +307,20 @@ class ActionNode : public SeqRegExpNode {
   enum ActionType {
     SET_REGISTER_FOR_LOOP,
     INCREMENT_REGISTER,
-    CLEAR_POSITION,
+    STORE_POSITION,
     RESTORE_POSITION,
     BEGIN_POSITIVE_SUBMATCH,
     BEGIN_NEGATIVE_SUBMATCH,
     POSITIVE_SUBMATCH_SUCCESS,
     EMPTY_MATCH_CHECK,
     CLEAR_CAPTURES,
-    MODIFY_FLAGS
+    MODIFY_FLAGS,
+    EATS_AT_LEAST,
   };
   static ActionNode* SetRegisterForLoop(int reg, int val,
                                         RegExpNode* on_success);
   static ActionNode* IncrementRegister(int reg, RegExpNode* on_success);
-  static ActionNode* ClearPosition(int reg, RegExpNode* on_success);
+  static ActionNode* StorePosition(int reg, RegExpNode* on_success);
   static ActionNode* RestorePosition(int reg, RegExpNode* on_success);
   static ActionNode* ClearCaptures(Interval range, RegExpNode* on_success);
   static ActionNode* BeginPositiveSubmatch(int stack_pointer_reg,
@@ -378,13 +339,14 @@ class ActionNode : public SeqRegExpNode {
                                      int repetition_limit,
                                      RegExpNode* on_success);
   static ActionNode* ModifyFlags(RegExpFlags flags, RegExpNode* on_success);
+  static ActionNode* EatsAtLeast(int characters, RegExpNode* on_success);
   ActionNode* AsActionNode() override { return this; }
   void Accept(NodeVisitor* visitor) override;
   V8_WARN_UNUSED_RESULT EmitResult Emit(RegExpCompiler* compiler,
                                         Trace* trace) override;
   void GetQuickCheckDetails(QuickCheckDetails* details,
                             RegExpCompiler* compiler, int filled_in,
-                            bool not_at_start) override;
+                            bool not_at_start, int budget) override;
   void FillInBMInfo(Isolate* isolate, int offset, int budget,
                     BoyerMooreLookahead* bm, bool not_at_start) override;
   ActionType action_type() const { return action_type_; }
@@ -400,6 +362,10 @@ class ActionNode : public SeqRegExpNode {
     DCHECK_EQ(action_type(), BEGIN_POSITIVE_SUBMATCH);
     return data_.u_submatch.success_node;
   }
+  int stored_eats_at_least() {
+    DCHECK_EQ(action_type(), EATS_AT_LEAST);
+    return data_.u_eats_at_least.characters;
+  }
 
   bool Mentions(int reg) const {
     return base::IsInRange(reg, register_from(), register_to());
@@ -411,7 +377,7 @@ class ActionNode : public SeqRegExpNode {
   }
 
   bool IsSimpleAction() const {
-    return action_type() == CLEAR_POSITION ||
+    return action_type() == STORE_POSITION ||
            action_type() == RESTORE_POSITION ||
            action_type() == INCREMENT_REGISTER ||
            action_type() == SET_REGISTER_FOR_LOOP ||
@@ -460,6 +426,9 @@ class ActionNode : public SeqRegExpNode {
     struct {
       int flags;
     } u_modify_flags;
+    struct {
+      int characters;
+    } u_eats_at_least;
   } data_;
 
   ActionType action_type_;
@@ -499,7 +468,7 @@ class TextNode : public SeqRegExpNode {
                                         Trace* trace) override;
   void GetQuickCheckDetails(QuickCheckDetails* details,
                             RegExpCompiler* compiler, int characters_filled_in,
-                            bool not_at_start) override;
+                            bool not_at_start, int budget) override;
   ZoneList<TextElement>* elements() { return elms_; }
   bool read_backward() { return read_backward_; }
   void MakeCaseIndependent(Isolate* isolate, bool is_one_byte,
@@ -510,8 +479,10 @@ class TextNode : public SeqRegExpNode {
   void FillInBMInfo(Isolate* isolate, int offset, int budget,
                     BoyerMooreLookahead* bm, bool not_at_start) override;
   void CalculateOffsets();
-  RegExpNode* FilterOneByte(int depth, RegExpCompiler* compiler) override;
   int Length();
+
+  // Returns false if the text node can't match in one-byte mode.
+  bool CanMatchLatin1(RegExpCompiler* compiler);
 
  private:
   enum TextEmitPassType {
@@ -558,7 +529,7 @@ class AssertionNode : public SeqRegExpNode {
                                         Trace* trace) override;
   void GetQuickCheckDetails(QuickCheckDetails* details,
                             RegExpCompiler* compiler, int filled_in,
-                            bool not_at_start) override;
+                            bool not_at_start, int budget) override;
   void FillInBMInfo(Isolate* isolate, int offset, int budget,
                     BoyerMooreLookahead* bm, bool not_at_start) override;
   AssertionType assertion_type() { return assertion_type_; }
@@ -593,7 +564,7 @@ class BackReferenceNode : public SeqRegExpNode {
                                         Trace* trace) override;
   void GetQuickCheckDetails(QuickCheckDetails* details,
                             RegExpCompiler* compiler, int characters_filled_in,
-                            bool not_at_start) override {
+                            bool not_at_start, int budget) override {
     return;
   }
   void FillInBMInfo(Isolate* isolate, int offset, int budget,
@@ -608,22 +579,21 @@ class BackReferenceNode : public SeqRegExpNode {
 class EndNode : public RegExpNode {
  public:
   enum Action { ACCEPT, BACKTRACK, NEGATIVE_SUBMATCH_SUCCESS };
-  EndNode(Action action, Zone* zone) : RegExpNode(zone), action_(action) {}
+  EndNode(Action action, Zone* zone) : RegExpNode(zone), action_(action) {
+    EatsAtLeastInfo large(kLargeEatsAtLeastValue);
+    if (action == BACKTRACK) set_eats_at_least_info(large);
+  }
   EndNode* AsEndNode() override { return this; }
   void Accept(NodeVisitor* visitor) override;
   V8_WARN_UNUSED_RESULT EmitResult Emit(RegExpCompiler* compiler,
                                         Trace* trace) override;
   void GetQuickCheckDetails(QuickCheckDetails* details,
                             RegExpCompiler* compiler, int characters_filled_in,
-                            bool not_at_start) override {
-    // Returning 0 from EatsAtLeast should ensure we never get here.
-    UNREACHABLE();
-  }
+                            bool not_at_start, int budget) override;
   void FillInBMInfo(Isolate* isolate, int offset, int budget,
-                    BoyerMooreLookahead* bm, bool not_at_start) override {
-    // Returning 0 from EatsAtLeast should ensure we never get here.
-    UNREACHABLE();
-  }
+                    BoyerMooreLookahead* bm, bool not_at_start) override {}
+
+  virtual bool IsBacktrack() const override { return action_ == BACKTRACK; }
 
  private:
   Action action_;
@@ -697,7 +667,7 @@ class ChoiceNode : public RegExpNode {
                                         Trace* trace) override;
   void GetQuickCheckDetails(QuickCheckDetails* details,
                             RegExpCompiler* compiler, int characters_filled_in,
-                            bool not_at_start) override;
+                            bool not_at_start, int budget) override;
   void FillInBMInfo(Isolate* isolate, int offset, int budget,
                     BoyerMooreLookahead* bm, bool not_at_start) override;
 
@@ -708,7 +678,6 @@ class ChoiceNode : public RegExpNode {
   virtual bool try_to_emit_quick_check_for_alternative(bool is_first) {
     return true;
   }
-  RegExpNode* FilterOneByte(int depth, RegExpCompiler* compiler) override;
   virtual bool read_backward() { return false; }
 
  protected:
@@ -729,13 +698,14 @@ class ChoiceNode : public RegExpNode {
   void SetUpPreLoad(RegExpCompiler* compiler, Trace* current_trace,
                     PreloadState* preloads);
   void AssertGuardsMentionRegisters(Trace* trace);
-  int EmitOptimizedUnanchoredSearch(RegExpCompiler* compiler, Trace* trace);
+  int EmitOptimizedUnanchoredSearch(RegExpCompiler* compiler, Trace* trace,
+                                    SpecialLoopState* search_loop_state);
   // Returns nullptr on failure.
   // TODO(jgruber): Consider wrapping the return value in EmitResult.
   V8_WARN_UNUSED_RESULT Trace* EmitFixedLengthLoop(
       RegExpCompiler* compiler, Trace* trace,
       AlternativeGenerationList* alt_gens, PreloadState* preloads,
-      FixedLengthLoopState* fixed_length_loop_state, int text_length,
+      SpecialLoopState* fixed_length_loop_state, int text_length,
       RegExpFlags flags);
   V8_WARN_UNUSED_RESULT EmitResult
   EmitChoices(RegExpCompiler* compiler, AlternativeGenerationList* alt_gens,
@@ -759,7 +729,7 @@ class NegativeLookaroundChoiceNode : public ChoiceNode {
   }
   void GetQuickCheckDetails(QuickCheckDetails* details,
                             RegExpCompiler* compiler, int characters_filled_in,
-                            bool not_at_start) override;
+                            bool not_at_start, int budget) override;
   void FillInBMInfo(Isolate* isolate, int offset, int budget,
                     BoyerMooreLookahead* bm, bool not_at_start) override {
     continue_node()->FillInBMInfo(isolate, offset, budget - 1, bm,
@@ -786,42 +756,31 @@ class NegativeLookaroundChoiceNode : public ChoiceNode {
     return this;
   }
   void Accept(NodeVisitor* visitor) override;
-  RegExpNode* FilterOneByte(int depth, RegExpCompiler* compiler) override;
 };
 
 class LoopChoiceNode : public ChoiceNode {
  public:
-  LoopChoiceNode(bool body_can_be_zero_length, bool read_backward,
-                 int min_loop_iterations, Zone* zone)
+  LoopChoiceNode(bool body_can_be_zero_length, bool read_backward, Zone* zone)
       : ChoiceNode(2, zone),
         loop_node_(nullptr),
         continue_node_(nullptr),
         body_can_be_zero_length_(body_can_be_zero_length),
-        read_backward_(read_backward),
-        traversed_loop_initialization_node_(false),
-        min_loop_iterations_(min_loop_iterations) {}
+        read_backward_(read_backward) {}
   void AddLoopAlternative(GuardedAlternative alt);
   void AddContinueAlternative(GuardedAlternative alt);
   V8_WARN_UNUSED_RESULT EmitResult Emit(RegExpCompiler* compiler,
                                         Trace* trace) override;
   void GetQuickCheckDetails(QuickCheckDetails* details,
                             RegExpCompiler* compiler, int characters_filled_in,
-                            bool not_at_start) override;
-  void GetQuickCheckDetailsFromLoopEntry(QuickCheckDetails* details,
-                                         RegExpCompiler* compiler,
-                                         int characters_filled_in,
-                                         bool not_at_start) override;
+                            bool not_at_start, int budget) override;
   void FillInBMInfo(Isolate* isolate, int offset, int budget,
                     BoyerMooreLookahead* bm, bool not_at_start) override;
-  EatsAtLeastInfo EatsAtLeastFromLoopEntry() override;
   RegExpNode* loop_node() { return loop_node_; }
   RegExpNode* continue_node() { return continue_node_; }
   bool body_can_be_zero_length() { return body_can_be_zero_length_; }
-  int min_loop_iterations() const { return min_loop_iterations_; }
   bool read_backward() override { return read_backward_; }
   LoopChoiceNode* AsLoopChoiceNode() override { return this; }
   void Accept(NodeVisitor* visitor) override;
-  RegExpNode* FilterOneByte(int depth, RegExpCompiler* compiler) override;
 
  private:
   // AddAlternative is made private for loop nodes because alternatives
@@ -835,22 +794,6 @@ class LoopChoiceNode : public ChoiceNode {
   RegExpNode* continue_node_;
   bool body_can_be_zero_length_;
   bool read_backward_;
-
-  // Temporary marker set only while generating quick check details. Represents
-  // whether GetQuickCheckDetails traversed the initialization node for this
-  // loop's counter. If so, we may be able to generate stricter quick checks
-  // because we know the loop node must match at least min_loop_iterations_
-  // times before the continuation node can match.
-  bool traversed_loop_initialization_node_;
-
-  // The minimum number of times the loop_node_ must match before the
-  // continue_node_ might be considered. This value can be temporarily decreased
-  // while generating quick check details, to represent the remaining iterations
-  // after the completed portion of the quick check details.
-  int min_loop_iterations_;
-
-  friend class IterationDecrementer;
-  friend class LoopInitializationMarker;
 };
 
 class NodeVisitor {

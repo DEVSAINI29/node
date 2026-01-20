@@ -32,23 +32,44 @@ constexpr uint32_t kMaxUtf16CodeUnitU = 0xffff;
 
 RegExpNode* RegExpTree::ToNode(RegExpCompiler* compiler,
                                RegExpNode* on_success) {
+  // We try to remove entire subbranches of the node structure that can't
+  // succeed by returning backtrack nodes instead of nodes that first match
+  // something and then inevitably backtrack.
+  if (on_success->IsBacktrack()) return on_success;
   compiler->ToNodeMaybeCheckForStackOverflow();
+  if (compiler->IsRegExpTooBig()) {
+    // We can always return this even though it may not be the expected
+    // subclass because all call sites already have to check for this case.
+    Zone* zone = compiler->zone();
+    return zone->New<EndNode>(EndNode::BACKTRACK, zone);
+  }
   return ToNodeImpl(compiler, on_success);
 }
 
 RegExpNode* RegExpAtom::ToNodeImpl(RegExpCompiler* compiler,
                                    RegExpNode* on_success) {
-  ZoneList<TextElement>* elms =
-      compiler->zone()->New<ZoneList<TextElement>>(1, compiler->zone());
-  elms->Add(TextElement::Atom(this), compiler->zone());
-  return compiler->zone()->New<TextNode>(elms, compiler->read_backward(),
-                                         on_success);
+  Zone* zone = compiler->zone();
+  ZoneList<TextElement>* elms = zone->New<ZoneList<TextElement>>(1, zone);
+  elms->Add(TextElement::Atom(this), zone);
+  TextNode* result =
+      zone->New<TextNode>(elms, compiler->read_backward(), on_success);
+  if (compiler->one_byte() && !result->CanMatchLatin1(compiler)) {
+    return zone->New<EndNode>(EndNode::BACKTRACK, zone);
+  }
+
+  return result;
 }
 
 RegExpNode* RegExpText::ToNodeImpl(RegExpCompiler* compiler,
                                    RegExpNode* on_success) {
-  return compiler->zone()->New<TextNode>(elements(), compiler->read_backward(),
-                                         on_success);
+  Zone* zone = compiler->zone();
+  TextNode* result =
+      zone->New<TextNode>(elements(), compiler->read_backward(), on_success);
+  if (compiler->one_byte() && !result->CanMatchLatin1(compiler)) {
+    return zone->New<EndNode>(EndNode::BACKTRACK, zone);
+  }
+
+  return result;
 }
 
 namespace {
@@ -466,14 +487,21 @@ RegExpNode* RegExpClassRanges::ToNodeImpl(RegExpCompiler* compiler,
   ZoneList<CharacterRange>* ranges = this->ranges(zone);
 
   const bool needs_case_folding =
-      NeedsUnicodeCaseEquivalents(compiler->flags()) && !is_case_folded();
+      NeedsUnicodeCaseEquivalents(compiler->flags()) &&
+      !no_case_folding_needed();
   if (needs_case_folding) {
     CharacterRange::AddUnicodeCaseEquivalents(ranges, zone);
   }
 
   if (!IsEitherUnicode(compiler->flags()) || compiler->one_byte() ||
       contains_split_surrogate()) {
-    return zone->New<TextNode>(this, compiler->read_backward(), on_success);
+    TextNode* result =
+        zone->New<TextNode>(this, compiler->read_backward(), on_success);
+    if (compiler->one_byte() && !result->CanMatchLatin1(compiler)) {
+      return zone->New<EndNode>(EndNode::BACKTRACK, zone);
+    }
+
+    return result;
   }
 
   if (is_negated()) {
@@ -494,9 +522,7 @@ RegExpNode* RegExpClassRanges::ToNodeImpl(RegExpCompiler* compiler,
   }
 
   if (ranges->length() == 0) {
-    // The empty character class is used as a 'fail' node.
-    RegExpClassRanges* fail = zone->New<RegExpClassRanges>(zone, ranges);
-    return zone->New<TextNode>(fail, compiler->read_backward(), on_success);
+    return zone->New<EndNode>(EndNode::BACKTRACK, zone);
   }
 
   if (set_.is_standard() &&
@@ -534,13 +560,10 @@ RegExpNode* RegExpClassSetOperand::ToNodeImpl(RegExpCompiler* compiler,
   if (size == 0) {
     // If neither ranges nor strings are present, the operand is equal to an
     // empty range (matching nothing).
-    ZoneList<CharacterRange>* empty =
-        zone->template New<ZoneList<CharacterRange>>(0, zone);
-    return zone->template New<RegExpClassRanges>(zone, empty)
-        ->ToNode(compiler, on_success);
+    return zone->New<EndNode>(EndNode::BACKTRACK, zone);
   }
   ZoneList<RegExpTree*>* alternatives =
-      zone->template New<ZoneList<RegExpTree*>>(size, zone);
+      zone->New<ZoneList<RegExpTree*>>(size, zone);
   // Strings are sorted by length first (larger strings before shorter ones).
   // See the comment on CharacterClassStrings.
   // Empty strings (if present) are added after character ranges.
@@ -559,9 +582,10 @@ RegExpNode* RegExpClassSetOperand::ToNodeImpl(RegExpCompiler* compiler,
     // (e.g. before building complements).
     // It is therefore the parsers responsibility to case fold (sub-) ranges
     // before creating ClassSetOperands.
-    alternatives->Add(zone->template New<RegExpClassRanges>(
-                          zone, ranges(), RegExpClassRanges::IS_CASE_FOLDED),
-                      zone);
+    alternatives->Add(
+        zone->New<RegExpClassRanges>(zone, ranges(),
+                                     RegExpClassRanges::NO_CASE_FOLDING_NEEDED),
+        zone);
   }
   if (empty_string != nullptr) {
     alternatives->Add(empty_string, zone);
@@ -572,7 +596,7 @@ RegExpNode* RegExpClassSetOperand::ToNodeImpl(RegExpCompiler* compiler,
     DCHECK_EQ(alternatives->length(), 1);
     node = alternatives->first();
   } else {
-    node = zone->template New<RegExpDisjunction>(alternatives);
+    node = zone->New<RegExpDisjunction>(alternatives);
   }
   return node->ToNode(compiler, on_success);
 }
@@ -581,7 +605,7 @@ RegExpNode* RegExpClassSetExpression::ToNodeImpl(RegExpCompiler* compiler,
                                                  RegExpNode* on_success) {
   Zone* zone = compiler->zone();
   ZoneList<CharacterRange>* temp_ranges =
-      zone->template New<ZoneList<CharacterRange>>(4, zone);
+      zone->New<ZoneList<CharacterRange>>(4, zone);
   RegExpClassSetOperand* root = ComputeExpression(this, temp_ranges, zone);
   return root->ToNode(compiler, on_success);
 }
@@ -590,7 +614,7 @@ void RegExpClassSetOperand::Union(RegExpClassSetOperand* other, Zone* zone) {
   ranges()->AddAll(*other->ranges(), zone);
   if (other->has_strings()) {
     if (strings_ == nullptr) {
-      strings_ = zone->template New<CharacterClassStrings>(zone);
+      strings_ = zone->New<CharacterClassStrings>(zone);
     }
     strings()->insert(other->strings()->begin(), other->strings()->end());
   }
@@ -1049,9 +1073,15 @@ RegExpNode* RegExpDisjunction::ToNodeImpl(RegExpCompiler* compiler,
   for (int i = 0; i < length; i++) {
     GuardedAlternative alternative(
         alternatives->at(i)->ToNode(compiler, on_success));
-    result->AddAlternative(alternative);
+    if (!alternative.node()->IsBacktrack()) {
+      result->AddAlternative(alternative);
+    }
   }
-  return result;
+  int node_length = result->alternatives()->length();
+  if (node_length >= 2) return result;
+  if (node_length == 1) return result->alternatives()->at(0).node();
+  Zone* zone = on_success->zone();
+  return zone->New<EndNode>(EndNode::BACKTRACK, zone);
 }
 
 RegExpNode* RegExpQuantifier::ToNodeImpl(RegExpCompiler* compiler,
@@ -1207,6 +1237,7 @@ RegExpNode* RegExpGroup::ToNodeImpl(RegExpCompiler* compiler,
   // Convert body using modifier.
   ModifiersScope modifiers_scope(compiler, flags());
   RegExpNode* body = body_->ToNode(compiler, on_success);
+  if (body->IsBacktrack()) return body;
 
   // Wrap body into modifier node.
   RegExpNode* modified_body = ActionNode::ModifyFlags(flags(), body);
@@ -1270,6 +1301,10 @@ RegExpNode* RegExpLookaround::ToNodeImpl(RegExpCompiler* compiler,
   Builder builder(is_positive(), on_success, stack_pointer_register,
                   position_register, register_count, register_start);
   RegExpNode* match = body_->ToNode(compiler, builder.on_match_success());
+  if (match->IsBacktrack() && (is_positive() || compiler->IsRegExpTooBig())) {
+    compiler->set_read_backward(was_reading_backward);
+    return match;
+  }
   result = builder.ForMatch(match);
   compiler->set_read_backward(was_reading_backward);
   return result;
@@ -1287,9 +1322,10 @@ RegExpNode* RegExpCapture::ToNode(RegExpTree* body, int index,
   int start_reg = RegExpCapture::StartRegister(index);
   int end_reg = RegExpCapture::EndRegister(index);
   if (compiler->read_backward()) std::swap(start_reg, end_reg);
-  RegExpNode* store_end = ActionNode::ClearPosition(end_reg, on_success);
+  RegExpNode* store_end = ActionNode::StorePosition(end_reg, on_success);
   RegExpNode* body_node = body->ToNode(compiler, store_end);
-  return ActionNode::ClearPosition(start_reg, body_node);
+  if (body_node->IsBacktrack()) return body_node;
+  return ActionNode::StorePosition(start_reg, body_node);
 }
 
 namespace {
@@ -2003,12 +2039,17 @@ RegExpNode* RegExpQuantifier::ToNode(int min, int max, bool is_greedy,
   bool body_can_be_empty = (body->min_match() == 0);
   int body_start_reg = RegExpCompiler::kNoRegister;
   Interval capture_registers = body->CaptureRegisters();
-  bool needs_capture_clearing = !capture_registers.is_empty();
+  // At the start of the next iteration of a quantifier the captures must be
+  // cleared, so that /(?:x(.)?z){2}/ when applied to "xyzxz" captures ""
+  // (rather than "y" from the first repeat). However, if the max number of
+  // iterations is 1 then there is no 'next repeat' so we don't need to do this.
+  bool needs_capture_clearing = !capture_registers.is_empty() && max != 1;
   Zone* zone = compiler->zone();
 
+  bool want_unroll = compiler->optimize() && v8_flags.regexp_unroll;
   if (body_can_be_empty) {
     body_start_reg = compiler->AllocateRegister();
-  } else if (compiler->optimize() && !needs_capture_clearing) {
+  } else if (want_unroll && !needs_capture_clearing) {
     // Only unroll if there are no captures and the body can't be
     // empty.
     {
@@ -2060,12 +2101,12 @@ RegExpNode* RegExpQuantifier::ToNode(int min, int max, bool is_greedy,
   int reg_ctr = needs_counter ? compiler->AllocateRegister()
                               : RegExpCompiler::kNoRegister;
   LoopChoiceNode* center = zone->New<LoopChoiceNode>(
-      body->min_match() == 0, compiler->read_backward(), min, zone);
+      body->min_match() == 0, compiler->read_backward(), zone);
   if (not_at_start && !compiler->read_backward()) center->set_not_at_start();
-  RegExpNode* loop_return =
-      needs_counter ? static_cast<RegExpNode*>(
-                          ActionNode::IncrementRegister(reg_ctr, center))
-                    : static_cast<RegExpNode*>(center);
+  RegExpNode* loop_return = center;
+  if (needs_counter) {
+    loop_return = ActionNode::IncrementRegister(reg_ctr, loop_return);
+  }
   if (body_can_be_empty) {
     // If the body can be empty we need to check if it was and then
     // backtrack.
@@ -2073,6 +2114,15 @@ RegExpNode* RegExpQuantifier::ToNode(int min, int max, bool is_greedy,
         ActionNode::EmptyMatchCheck(body_start_reg, reg_ctr, min, loop_return);
   }
   RegExpNode* body_node = body->ToNode(compiler, loop_return);
+  if (body_node->IsBacktrack()) {
+    // Body can never match. If there is a minimum number of iterations that
+    // means this whole part of the regexp can't match, so we just return the
+    // never-match (backtrack) node.
+    if (has_min) return body_node;
+    // Since there is no minimum number of iterations and the body can't match
+    // we can go straight to whatever comes after the quantifier.
+    return on_success;
+  }
   if (body_can_be_empty) {
     // If the body can be empty we need to store the start position
     // so we can bail out if it was empty.
@@ -2099,11 +2149,16 @@ RegExpNode* RegExpQuantifier::ToNode(int min, int max, bool is_greedy,
     center->AddContinueAlternative(rest_alt);
     center->AddLoopAlternative(body_alt);
   }
-  if (needs_counter) {
-    return ActionNode::SetRegisterForLoop(reg_ctr, 0, center);
-  } else {
-    return center;
+  RegExpNode* result = center;
+  if (min > 0 && body->min_match() > 0 && !compiler->read_backward()) {
+    uint8_t eats = base::saturated_cast<uint8_t>(
+        std::min(256, min) * std::min(256, body->min_match()));
+    result = ActionNode::EatsAtLeast(eats, result);
   }
+  if (needs_counter) {
+    result = ActionNode::SetRegisterForLoop(reg_ctr, 0, result);
+  }
+  return result;
 }
 
 }  // namespace internal

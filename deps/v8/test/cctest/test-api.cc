@@ -2872,7 +2872,7 @@ THREADED_TEST(DescriptorInheritance2) {
 void SimpleAccessorGetter(Local<String> name,
                           const v8::PropertyCallbackInfo<v8::Value>& info) {
   CHECK(i::ValidateCallbackInfo(info));
-  Local<Object> self = info.This().As<Object>();
+  Local<Object> self = info.HolderV2();
   info.GetReturnValue().Set(
       self->Get(info.GetIsolate()->GetCurrentContext(),
                 String::Concat(info.GetIsolate(), v8_str("accessor_"), name))
@@ -2882,7 +2882,7 @@ void SimpleAccessorGetter(Local<String> name,
 void SimpleAccessorSetter(Local<String> name, Local<Value> value,
                           const v8::PropertyCallbackInfo<void>& info) {
   CHECK(i::ValidateCallbackInfo(info));
-  Local<Object> self = info.This().As<Object>();
+  Local<Object> self = info.HolderV2();
   CHECK(self->Set(info.GetIsolate()->GetCurrentContext(),
                   String::Concat(info.GetIsolate(), v8_str("accessor_"), name),
                   value)
@@ -3487,8 +3487,9 @@ THREADED_TEST(EmbedderDataAlignedPointersViaDetachedGlobal) {
 
 static void CheckEmbedderData(LocalContext* env, int index,
                               v8::Local<Value> data) {
-  (*env)->SetEmbedderData(index, data);
-  CHECK((*env)->GetEmbedderData(index)->StrictEquals(data));
+  (*env)->SetEmbedderDataV2(index, data);
+  CHECK(v8::Local<v8::Value>::Cast((*env)->GetEmbedderDataV2(index))
+            ->StrictEquals(data));
 }
 
 THREADED_TEST(EmbedderData) {
@@ -8603,27 +8604,6 @@ void PGetter(Local<Name> name,
       info.HolderV2()
           ->Equals(context, global->Get(context, v8_str("o1")).ToLocalChecked())
           .FromJust());
-  if (name->Equals(context, v8_str("p1")).FromJust()) {
-    CHECK(info.This()
-              ->Equals(context,
-                       global->Get(context, v8_str("o1")).ToLocalChecked())
-              .FromJust());
-  } else if (name->Equals(context, v8_str("p2")).FromJust()) {
-    CHECK(info.This()
-              ->Equals(context,
-                       global->Get(context, v8_str("o2")).ToLocalChecked())
-              .FromJust());
-  } else if (name->Equals(context, v8_str("p3")).FromJust()) {
-    CHECK(info.This()
-              ->Equals(context,
-                       global->Get(context, v8_str("o3")).ToLocalChecked())
-              .FromJust());
-  } else if (name->Equals(context, v8_str("p4")).FromJust()) {
-    CHECK(info.This()
-              ->Equals(context,
-                       global->Get(context, v8_str("o4")).ToLocalChecked())
-              .FromJust());
-  }
 }
 
 void RunHolderTest(v8::Local<v8::ObjectTemplate> obj) {
@@ -8656,31 +8636,12 @@ v8::Intercepted PGetter2(Local<Name> name,
       info.HolderV2()
           ->Equals(context, global->Get(context, v8_str("o1")).ToLocalChecked())
           .FromJust());
-  if (name->Equals(context, v8_str("p1")).FromJust()) {
-    CHECK(info.This()
-              ->Equals(context,
-                       global->Get(context, v8_str("o1")).ToLocalChecked())
-              .FromJust());
-  } else if (name->Equals(context, v8_str("p2")).FromJust()) {
-    CHECK(info.This()
-              ->Equals(context,
-                       global->Get(context, v8_str("o2")).ToLocalChecked())
-              .FromJust());
-  } else if (name->Equals(context, v8_str("p3")).FromJust()) {
-    CHECK(info.This()
-              ->Equals(context,
-                       global->Get(context, v8_str("o3")).ToLocalChecked())
-              .FromJust());
-  } else if (name->Equals(context, v8_str("p4")).FromJust()) {
-    CHECK(info.This()
-              ->Equals(context,
-                       global->Get(context, v8_str("o4")).ToLocalChecked())
-              .FromJust());
-  }
+
   // Return something to indicate that the operation was intercepted.
   info.GetReturnValue().Set(True(isolate));
   return v8::Intercepted::kYes;
 }
+
 }  // namespace
 
 THREADED_TEST(GetterHolders) {
@@ -9520,22 +9481,27 @@ THREADED_TEST(ExceptionCreateMessageLength) {
   CHECK_LT(1000, try_catch.Message()->Get()->Length());
 }
 
-static void YGetter(Local<Name> name,
-                    const v8::PropertyCallbackInfo<v8::Value>& info) {
+namespace {
+
+void YGetter(Local<Name> name,
+             const v8::PropertyCallbackInfo<v8::Value>& info) {
   CHECK(i::ValidateCallbackInfo(info));
   ApiTestFuzzer::Fuzz();
   info.GetReturnValue().Set(v8_num(10));
 }
 
-static void YSetter(Local<Name> name, Local<Value> value,
-                    const v8::PropertyCallbackInfo<void>& info) {
+void YSetter(Local<Name> name, Local<Value> value,
+             const v8::PropertyCallbackInfo<void>& info) {
   CHECK(i::ValidateCallbackInfo(info));
-  Local<Object> this_obj = info.This().As<Object>();
+  Local<Object> this_obj = info.HolderV2();
   v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
-  if (this_obj->Has(context, name).FromJust())
+  if (this_obj->Has(context, name).FromJust()) {
     this_obj->Delete(context, name).FromJust();
+  }
   CHECK(this_obj->Set(context, name, value).FromJust());
 }
+
+}  // namespace
 
 THREADED_TEST(DeleteAccessor) {
   v8::Isolate* isolate = CcTest::isolate();
@@ -14594,10 +14560,10 @@ UNINITIALIZED_TEST(SetJitCodeEventHandler) {
       foos[i].Reset(isolate, v8::Utils::ToLocal(foo));
 
       i::PagedSpace* foo_owning_space = reinterpret_cast<i::PagedSpace*>(
-          i::PageMetadata::FromHeapObject(foo->abstract_code(i_isolate))
+          i::NormalPage::FromHeapObject(foo->abstract_code(i_isolate))
               ->owner());
       i::PagedSpace* bar_owning_space = reinterpret_cast<i::PagedSpace*>(
-          i::PageMetadata::FromHeapObject(bar->abstract_code(i_isolate))
+          i::NormalPage::FromHeapObject(bar->abstract_code(i_isolate))
               ->owner());
 
       CHECK_EQ(foo_owning_space, bar_owning_space);
@@ -17632,8 +17598,6 @@ class StackOverflowThread : public v8::base::Thread {
 TEST(SetStackLimitInThreadAndStackOverflow) {
   // Set a small --stack-size flag.
   i::FlagScope<int> f_stack_size(&i::v8_flags.stack_size, 100);
-  // Trigger GC aggressively to verify that GC does not crash with stack litmit.
-  i::FlagScope<size_t> f_heap_size(&i::v8_flags.max_heap_size, 8);
   i::FlagScope<bool> f_expose_gc(&i::v8_flags.expose_gc, true);
 
   // ASAN requires more stack space.
@@ -18234,7 +18198,7 @@ TEST(Regress528) {
 
     context->Enter();
     Local<v8::String> obj = v8_str("");
-    context->SetEmbedderData(0, obj);
+    context->SetEmbedderDataV2(0, obj);
     CompileRun(source_simple);
     context->Exit();
   }
@@ -18619,7 +18583,6 @@ THREADED_TEST(FunctionProtoToString) {
 static void GetterWhichReturns42(
     Local<Name> name, const v8::PropertyCallbackInfo<v8::Value>& info) {
   CHECK(i::ValidateCallbackInfo(info));
-  CHECK(IsJSObject(*v8::Utils::OpenDirectHandle(*info.This())));
   CHECK(IsJSObject(*v8::Utils::OpenDirectHandle(*info.HolderV2())));
   info.GetReturnValue().Set(v8_num(42));
 }
@@ -18628,10 +18591,8 @@ static void SetterWhichSetsYOnThisTo23(
     Local<Name> name, Local<Value> value,
     const v8::PropertyCallbackInfo<void>& info) {
   CHECK(i::ValidateCallbackInfo(info));
-  CHECK(IsJSObject(*v8::Utils::OpenDirectHandle(*info.This())));
   CHECK(IsJSObject(*v8::Utils::OpenDirectHandle(*info.HolderV2())));
-  info.This()
-      .As<Object>()
+  info.HolderV2()
       ->Set(info.GetIsolate()->GetCurrentContext(), v8_str("y"), v8_num(23))
       .FromJust();
 }
@@ -18639,7 +18600,6 @@ static void SetterWhichSetsYOnThisTo23(
 v8::Intercepted FooGetInterceptor(
     Local<Name> name, const v8::PropertyCallbackInfo<v8::Value>& info) {
   CHECK(i::ValidateCallbackInfo(info));
-  CHECK(IsJSObject(*v8::Utils::OpenDirectHandle(*info.This())));
   CHECK(IsJSObject(*v8::Utils::OpenDirectHandle(*info.HolderV2())));
   if (!name->Equals(info.GetIsolate()->GetCurrentContext(), v8_str("foo"))
            .FromJust()) {
@@ -18652,14 +18612,12 @@ v8::Intercepted FooGetInterceptor(
 v8::Intercepted FooSetInterceptor(Local<Name> name, Local<Value> value,
                                   const v8::PropertyCallbackInfo<void>& info) {
   CHECK(i::ValidateCallbackInfo(info));
-  CHECK(IsJSObject(*v8::Utils::OpenDirectHandle(*info.This())));
   CHECK(IsJSObject(*v8::Utils::OpenDirectHandle(*info.HolderV2())));
   if (!name->Equals(info.GetIsolate()->GetCurrentContext(), v8_str("foo"))
            .FromJust()) {
     return v8::Intercepted::kNo;
   }
-  info.This()
-      .As<Object>()
+  info.HolderV2()
       ->Set(info.GetIsolate()->GetCurrentContext(), v8_str("y"), v8_num(23))
       .FromJust();
   return v8::Intercepted::kYes;
@@ -18723,7 +18681,7 @@ v8::Intercepted NamedPropertySetterWhichSetsYOnThisTo23(
   CHECK(i::ValidateCallbackInfo(info));
   v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
   if (name->Equals(context, v8_str("x")).FromJust()) {
-    info.This().As<Object>()->Set(context, v8_str("y"), v8_num(23)).FromJust();
+    info.HolderV2()->Set(context, v8_str("y"), v8_num(23)).FromJust();
     return v8::Intercepted::kYes;
   }
   return v8::Intercepted::kNo;
@@ -22619,20 +22577,11 @@ TEST(EscapableHandleScope) {
   }
 }
 
-// Allow usages of v8::PropertyCallbackInfo<T>::Holder() for now.
-// TODO(https://crbug.com/333672197): remove.
-START_ALLOW_USE_DEPRECATED()
-
 static void SetterWhichExpectsThisAndHolderToDiffer(
     Local<Name>, Local<Value>, const v8::PropertyCallbackInfo<void>& info) {
-  CHECK(i::ValidateCallbackInfo(info));
-  CHECK(info.Holder() != info.This());
-  CHECK(info.HolderV2() != info.This());
+  // Writes through prototypes do not trigger interceptor setter callback.
+  UNREACHABLE();
 }
-
-// Allow usages of v8::PropertyCallbackInfo<T>::Holder() for now.
-// TODO(https://crbug.com/333672197): remove.
-END_ALLOW_USE_DEPRECATED()
 
 TEST(Regress239669) {
   LocalContext context;
@@ -26890,10 +26839,10 @@ TEST(SetPrototypeTemplate) {
   ExpectTrue("Image.prototype === HTMLImageElement.prototype");
 }
 
-void ensure_receiver_is_global_proxy(
+void EnsureHolderIsJSGlobalProxy(
     v8::Local<v8::Name>, const v8::PropertyCallbackInfo<v8::Value>& info) {
   CHECK(i::ValidateCallbackInfo(info));
-  CHECK(IsJSGlobalProxy(*v8::Utils::OpenDirectHandle(*info.This())));
+  CHECK(IsJSGlobalProxy(*v8::Utils::OpenDirectHandle(*info.HolderV2())));
 }
 
 THREADED_TEST(GlobalAccessorInfo) {
@@ -26903,7 +26852,7 @@ THREADED_TEST(GlobalAccessorInfo) {
   global_template->SetNativeDataProperty(
       v8::String::NewFromUtf8Literal(isolate, "prop",
                                      v8::NewStringType::kInternalized),
-      &ensure_receiver_is_global_proxy);
+      &EnsureHolderIsJSGlobalProxy);
   LocalContext env(nullptr, global_template);
   CompileRun("for (var i = 0; i < 10; i++) this.prop");
   CompileRun("for (var i = 0; i < 10; i++) prop");
@@ -26972,11 +26921,11 @@ enum ContextId { EnteredContext, CurrentContext };
 
 void CheckContexts(v8::Isolate* isolate) {
   CHECK_EQ(CurrentContext, isolate->GetCurrentContext()
-                               ->GetEmbedderData(1)
+                               ->GetEmbedderDataV2(1)
                                .As<v8::Integer>()
                                ->Value());
   CHECK_EQ(EnteredContext, isolate->GetEnteredOrMicrotaskContext()
-                               ->GetEmbedderData(1)
+                               ->GetEmbedderDataV2(1)
                                .As<v8::Integer>()
                                ->Value());
 }
@@ -27004,10 +26953,10 @@ TEST(CorrectEnteredContext) {
   v8::HandleScope scope(CcTest::isolate());
 
   LocalContext currentContext;
-  currentContext->SetEmbedderData(
+  currentContext->SetEmbedderDataV2(
       1, v8::Integer::New(currentContext.isolate(), CurrentContext));
   LocalContext enteredContext;
-  enteredContext->SetEmbedderData(
+  enteredContext->SetEmbedderDataV2(
       1, v8::Integer::New(enteredContext.isolate(), EnteredContext));
 
   v8::Context::Scope contextScope(enteredContext.local());
@@ -27114,13 +27063,11 @@ HostImportModuleDynamicallyWithAttributesCallbackResolve(
        i < import_attributes->Length() / kAttributeEntrySizeForDynamicImport;
        ++i) {
     Local<String> attribute_key =
-        import_attributes
-            ->Get(context, (i * kAttributeEntrySizeForDynamicImport))
+        import_attributes->Get((i * kAttributeEntrySizeForDynamicImport))
             .As<Value>()
             .As<String>();
     Local<String> attribute_value =
-        import_attributes
-            ->Get(context, (i * kAttributeEntrySizeForDynamicImport) + 1)
+        import_attributes->Get((i * kAttributeEntrySizeForDynamicImport) + 1)
             .As<Value>()
             .As<String>();
     if (v8_str("a")->StrictEquals(attribute_key)) {

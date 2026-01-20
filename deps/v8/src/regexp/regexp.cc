@@ -753,9 +753,8 @@ namespace {
 std::unique_ptr<RegExpMacroAssembler> CreateNativeMacroAssembler(
     Isolate* isolate, Zone* zone, bool is_one_byte, int output_register_count) {
   std::unique_ptr<RegExpMacroAssembler> macro_assembler;
-  NativeRegExpMacroAssembler::Mode mode =
-      is_one_byte ? NativeRegExpMacroAssembler::LATIN1
-                  : NativeRegExpMacroAssembler::UC16;
+  RegExpMacroAssembler::Mode mode =
+      is_one_byte ? RegExpMacroAssembler::LATIN1 : RegExpMacroAssembler::UC16;
 
 #if V8_TARGET_ARCH_IA32
   macro_assembler.reset(
@@ -1011,14 +1010,6 @@ std::optional<int> RegExpImpl::IrregexpExec(
     int32_t* result_offsets_vector, uint32_t result_offsets_vector_length) {
   subject = String::Flatten(isolate, subject);
 
-#ifdef DEBUG
-  if (v8_flags.trace_regexp_bytecodes && regexp_data->ShouldProduceBytecode()) {
-    PrintF("\n\nRegexp match:   /%s/\n\n",
-           regexp_data->source()->ToCString().get());
-    PrintF("\n\nSubject string: '%s'\n\n", subject->ToCString().get());
-  }
-#endif
-
   const int original_register_count =
       JSRegExp::RegistersForCaptureCount(regexp_data->capture_count());
 
@@ -1207,7 +1198,10 @@ bool RegExpImpl::Compile(Isolate* isolate, Zone* zone, RegExpCompileData* data,
   } else {
     DCHECK_EQ(data->compilation_target, RegExpCompilationTarget::kBytecode);
     // Interpreted regexp implementation.
-    macro_assembler.reset(new RegExpBytecodeGenerator(isolate, zone));
+    macro_assembler.reset(
+        new RegExpBytecodeGenerator(isolate, zone,
+                                    is_one_byte ? RegExpMacroAssembler::LATIN1
+                                                : RegExpMacroAssembler::UC16));
 #ifdef DEBUG
     if (v8_flags.trace_regexp_assembler) {
       std::unique_ptr<RegExpMacroAssembler> tracer_macro_assembler =

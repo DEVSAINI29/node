@@ -82,19 +82,7 @@
 #define MAP_ANONYMOUS MAP_ANON
 #endif
 
-/*
- * NOTE: illumos starting with illumos#14418 (pushed April 20th, 2022)
- * prototypes madvise(3C) properly with a `void *` first argument.
- * The only way to detect this outside of configure-time checking is to
- * check for the existence of MEMCNTL_SHARED, which gets defined for the first
- * time in illumos#14418 under the same circumstances save _STRICT_POSIX, which
- * thankfully neither Solaris nor illumos builds of Node or V8 do.
- *
- * If some future illumos push changes the MEMCNTL_SHARED assumptions made
- * above, the illumos check below will have to be revisited.  This check
- * will work on both pre-and-post illumos#14418 illumos environments.
- */
-#if defined(V8_OS_SOLARIS) && !(defined(__illumos__) && defined(MEMCNTL_SHARED))
+#if defined(V8_OS_SOLARIS)
 #if (defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE > 2) || defined(__EXTENSIONS__)
 extern "C" int madvise(caddr_t, size_t, int);
 #else
@@ -141,10 +129,10 @@ const int kMmapFdOffset = 0;
 enum class PageType { kShared, kPrivate };
 
 int GetFlagsForMemoryPermission(OS::MemoryPermission access, PageType page_type,
-                                PlatformSharedMemoryHandle handle,
+                                std::optional<SharedMemoryHandle> handle,
                                 bool fixed = false) {
   int flags = 0;
-  if (handle == kInvalidSharedMemoryHandle) {
+  if (!handle.has_value()) {
     flags |= MAP_ANONYMOUS;
   }
   if (fixed) {
@@ -175,7 +163,7 @@ int GetFlagsForMemoryPermission(OS::MemoryPermission access, PageType page_type,
 
 void* Allocate(void* hint, size_t size, OS::MemoryPermission access,
                PageType page_type,
-               PlatformSharedMemoryHandle handle = kInvalidSharedMemoryHandle,
+               std::optional<SharedMemoryHandle> handle = std::nullopt,
                bool fixed = false) {
   int prot = GetProtectionFromMemoryPermission(access);
   int flags = GetFlagsForMemoryPermission(access, page_type, handle, fixed);
@@ -185,7 +173,7 @@ void* Allocate(void* hint, size_t size, OS::MemoryPermission access,
   // tools like vmmap(1).
   int fd = VM_MAKE_TAG(255);
 #else
-  int fd = FileDescriptorFromSharedMemoryHandle(handle);
+  int fd = handle.has_value() ? handle->GetPlatformHandle() : -1;
 #endif
   void* result = mmap(hint, size, prot, flags, fd, kMmapFdOffset);
   if (result == MAP_FAILED) return nullptr;
@@ -280,15 +268,13 @@ bool OS::ArmUsingHardFloat() {
 #endif  // def __arm__
 #endif
 
-void PosixInitializeCommon(AbortMode abort_mode,
-                           const char* const gc_fake_mmap) {
-  g_abort_mode = abort_mode;
+void PosixInitializeCommon(const char* const gc_fake_mmap) {
   g_gc_fake_mmap = gc_fake_mmap;
 }
 
 #if !V8_OS_FUCHSIA
-void OS::Initialize(AbortMode abort_mode, const char* const gc_fake_mmap) {
-  PosixInitializeCommon(abort_mode, gc_fake_mmap);
+void OS::Initialize(const char* const gc_fake_mmap) {
+  PosixInitializeCommon(gc_fake_mmap);
 }
 #endif  // !V8_OS_FUCHSIA
 
@@ -477,7 +463,8 @@ void* OS::GetRandomMmapAddr() {
 #if !V8_OS_ZOS
 // static
 void* OS::Allocate(void* hint, size_t size, size_t alignment,
-                   MemoryPermission access, PlatformSharedMemoryHandle handle) {
+                   MemoryPermission access,
+                   std::optional<SharedMemoryHandle> handle) {
   size_t page_size = AllocatePageSize();
   DCHECK_EQ(0, size % page_size);
   DCHECK_EQ(0, alignment % page_size);
@@ -509,7 +496,7 @@ void* OS::Allocate(void* hint, size_t size, size_t alignment,
 
   DCHECK_EQ(size, request_size);
 
-  if (aligned_base != base && handle != kInvalidSharedMemoryHandle) {
+  if (aligned_base != base && handle.has_value()) {
     // We have to remap because the base of mapping must correspond to the base
     // of the the underlying file.
     uint8_t* new_base = reinterpret_cast<uint8_t*>(base::Allocate(
@@ -539,10 +526,10 @@ void OS::Free(void* address, size_t size) {
 #if !defined(V8_OS_DARWIN)
 // static
 void* OS::AllocateShared(void* hint, size_t size, MemoryPermission access,
-                         PlatformSharedMemoryHandle handle, uint64_t offset) {
+                         SharedMemoryHandle handle, uint64_t offset) {
   DCHECK_EQ(0, size % AllocatePageSize());
   int prot = GetProtectionFromMemoryPermission(access);
-  int fd = FileDescriptorFromSharedMemoryHandle(handle);
+  int fd = handle.GetPlatformHandle();
   void* result = mmap(hint, size, prot, MAP_SHARED, fd, offset);
   if (result == MAP_FAILED) return nullptr;
   return result;
@@ -708,7 +695,7 @@ bool OS::CanReserveAddressSpace() { return true; }
 // static
 std::optional<AddressSpaceReservation> OS::CreateAddressSpaceReservation(
     void* hint, size_t size, size_t alignment, MemoryPermission max_permission,
-    PlatformSharedMemoryHandle handle) {
+    std::optional<SharedMemoryHandle> handle) {
   // On POSIX, address space reservations are backed by private memory mappings.
   MemoryPermission permission = MemoryPermission::kNoAccess;
   if (max_permission == MemoryPermission::kReadWriteExecute) {
@@ -737,7 +724,8 @@ void OS::FreeAddressSpaceReservation(AddressSpaceReservation reservation) {
 // static
 // Need to disable CFI_ICALL due to the indirect call to memfd_create.
 DISABLE_CFI_ICALL
-PlatformSharedMemoryHandle OS::CreateSharedMemoryHandleForTesting(size_t size) {
+std::optional<SharedMemoryHandle> OS::CreateSharedMemoryHandleForTesting(
+    size_t size) {
 #if V8_OS_LINUX && !V8_OS_ANDROID
   // Use memfd_create if available, otherwise mkstemp.
   using memfd_create_t = int (*)(const char*, unsigned int);
@@ -752,18 +740,17 @@ PlatformSharedMemoryHandle OS::CreateSharedMemoryHandleForTesting(size_t size) {
     fd = mkstemp(filename);
     if (fd != -1) CHECK_EQ(0, unlink(filename));
   }
-  if (fd == -1) return kInvalidSharedMemoryHandle;
+  if (fd == -1) return std::nullopt;
   CHECK_EQ(0, ftruncate(fd, size));
-  return SharedMemoryHandleFromFileDescriptor(fd);
+  return SharedMemoryHandle::FromPlatformHandle(fd);
 #else
-  return kInvalidSharedMemoryHandle;
+  return std::nullopt;
 #endif
 }
 
 // static
-void OS::DestroySharedMemoryHandle(PlatformSharedMemoryHandle handle) {
-  DCHECK_NE(kInvalidSharedMemoryHandle, handle);
-  int fd = FileDescriptorFromSharedMemoryHandle(handle);
+void OS::DestroySharedMemoryHandle(SharedMemoryHandle handle) {
+  int fd = handle.GetPlatformHandle();
   CHECK_EQ(0, close(fd));
 }
 #endif  // !defined(V8_OS_DARWIN)
@@ -1004,17 +991,43 @@ int OS::GetLastError() {
 //
 
 FILE* OS::FOpen(const char* path, const char* mode) {
-  FILE* file = fopen(path, mode);
-  if (file == nullptr) return nullptr;
+  // Compute flags for `open` from the mode string.
+  // Note: We execute `open` separately to be able to pass `O_NOFOLLOW` so we do
+  // not follow symlinks (potentially in world-writable `/tmp` directory).
+  CHECK(mode[0] == 'r' || mode[0] == 'w' || mode[0] == 'a');
+  int flags = mode[0] == 'r' ? O_RDONLY : (O_WRONLY | O_CREAT);
+  if (mode[0] == 'w') flags |= O_TRUNC;
+  if (mode[0] == 'a') flags |= O_APPEND;
+  flags |= O_NOFOLLOW;
+  for (const char* c = mode + 1; *c != '\0'; ++c) {
+    if (*c == '+') {
+      // Upgrade to O_RDWR.
+      flags = (flags & ~O_ACCMODE) | O_RDWR;
+    } else if (*c == 'x') {
+      flags |= O_EXCL;
+    } else if (*c == 'b') {
+      // Ignore on POSIX.
+    } else {
+      FATAL("Unknown character '%c' in OS::FOpen mode \"%s\"", *c, mode);
+    }
+  }
+
+  int fd = open(path, flags, 0666);
+  if (fd == -1) return nullptr;
+
   struct stat file_stat;
-  if (fstat(fileno(file), &file_stat) != 0) {
-    fclose(file);
+  CHECK_EQ(0, fstat(fd, &file_stat));
+  bool is_regular_file = ((file_stat.st_mode & S_IFREG) != 0);
+  if (!is_regular_file) {
+    close(fd);
     return nullptr;
   }
-  bool is_regular_file = ((file_stat.st_mode & S_IFREG) != 0);
-  if (is_regular_file) return file;
-  fclose(file);
-  return nullptr;
+
+  FILE* file = fdopen(fd, mode);
+  if (file == nullptr && errno == ENOMEM) FatalOOM(OOMType::kProcess, "fdopen");
+  CHECK_NOT_NULL(file);
+  // `file` took ownership of `fd`.
+  return file;
 }
 
 
@@ -1169,11 +1182,11 @@ bool AddressSpaceReservation::Free(void* address, size_t size) {
 #if !defined(V8_OS_DARWIN)
 bool AddressSpaceReservation::AllocateShared(void* address, size_t size,
                                              OS::MemoryPermission access,
-                                             PlatformSharedMemoryHandle handle,
+                                             SharedMemoryHandle handle,
                                              uint64_t offset) {
   DCHECK(Contains(address, size));
   int prot = GetProtectionFromMemoryPermission(access);
-  int fd = FileDescriptorFromSharedMemoryHandle(handle);
+  int fd = handle.GetPlatformHandle();
   return mmap(address, size, prot, MAP_SHARED | MAP_FIXED, fd, offset) !=
          MAP_FAILED;
 }
